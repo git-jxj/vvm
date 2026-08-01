@@ -122,7 +122,8 @@ enum Commands {
     InstallExtra {
         /// Library name (deepgemm, flashinfer, deepep)
         name: String,
-        /// Git ref to install (commit sha, tag, or branch). Default: main
+        /// Ref to install: commit sha, tag, branch, or a release version like
+        /// 0.6.7. Defaults to the pin recorded by the active vllm.
         #[arg(long)]
         r#ref: Option<String>,
         /// Override the upstream repo URL

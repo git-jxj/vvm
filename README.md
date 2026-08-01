@@ -174,16 +174,30 @@ vvm exec branch:main -- pip install flash-attn   # pip → uv pip in the right v
 Packages that can't install cleanly via plain `pip install` — needing git submodules, vendored CUDA sources, or matching companion wheels — have bundled recipes:
 
 ```bash
-vvm install-extra deepgemm                        # DeepGEMM @ pin from active vllm's tools/install_deepgemm.sh
+vvm install-extra deepgemm                        # DeepGEMM @ the active vllm's pin
+vvm install-extra flashinfer                      # FlashInfer @ the active vllm's pin
+vvm install-extra deepep                          # DeepEP + NVSHMEM @ the active vllm's pin
+
 vvm install-extra deepgemm --ref main             # Latest main
-vvm install-extra flashinfer                      # Source build + auto-pull matching cubin/jit-cache
-vvm install-extra flashinfer --ref v0.6.7         # Pinned release
+vvm install-extra flashinfer --ref 0.6.7          # A release version
+vvm install-extra flashinfer --ref v0.6.7         # ...or its tag, same thing
 vvm install-extra flashinfer --ref nightly        # Prebuilt nightly wheels (flashinfer + cubin + jit-cache)
-vvm install-extra deepep                          # DeepEP + NVSHMEM (multi-node EP kernels)
-vvm install-extra deepep --ref main               # Latest DeepEP main
+vvm install-extra deepep --ref d4f41e4e93         # A specific commit
+vvm install-extra flashinfer --repo https://github.com/me/flashinfer-fork  # Your own fork
 ```
 
-**`flashinfer`** builds from source and automatically installs matching `flashinfer-cubin` + `flashinfer-jit-cache` wheels afterward (for release versions; dev builds skip). `--ref nightly` pulls prebuilt nightly wheels from `flashinfer.ai/whl/nightly/` instead.
+`--ref` takes a commit SHA, tag, branch, or a bare release version. Upstream tags releases `v0.6.7` while everyone says "0.6.7", so vvm tries the literal ref first — a fork that tags without the prefix keeps working — and only falls back to the `v`-prefixed form, telling you when it does. SHAs are never rewritten.
+
+**Version defaults follow the active vllm**, so an extra matches what that vllm was actually tested against rather than whatever upstream `main` happens to be today. `deepgemm` reads `DEEPGEMM_GIT_REF` from `tools/install_deepgemm.sh`; `deepep` and `flashinfer` read `DEEPEP_COMMIT_HASH` / `FLASHINFER_VERSION` from `docker/versions.json` — the manifest vllm's own release images build from. For `--path`/`--compile` installs the files are read straight from your source tree (works offline); for wheel installs they're fetched from GitHub at that install's commit or tag. Each install prints where its pin came from:
+
+```
+Installing DeepEP (https://github.com/deepseek-ai/DeepEP.git @ d4f41e4e93) [pin: active vllm]
+                                                                                 ^ active vllm | user | bundled fallback
+```
+
+`--ref` always wins, and a vendored default covers the cases where neither source is readable (offline, or a vllm predating the pin file).
+
+**`flashinfer`** installs prebuilt whenever it can. A release ref — including the default pin from vllm — comes straight from PyPI as a `py3-none-any` wheel, so it lands in seconds with no compile; `--ref nightly` pulls prebuilt nightly wheels from `flashinfer.ai/whl/nightly/`. Two companions are installed afterward, pinned to the same version (a mismatch makes flashinfer refuse to import). **`flashinfer-cubin`** is a vllm runtime requirement — `requirements/cuda.txt` pins it next to `flashinfer-python`, and since 0.6.14 it lives only on `flashinfer.ai/whl/`, not PyPI. **`flashinfer-jit-cache`** (~1.4 GB, CUDA- and arch-specific) is what vllm's Dockerfile adds on top; it buys startup latency, not correctness, so a miss is only a warning and `VVM_FLASHINFER_NO_JIT_CACHE=1` skips it — kernels then JIT on first use. Only a branch, a raw commit, or `--repo <fork>` actually needs a source build, which takes 10-20 minutes and is cached under `~/.vvm/cache/wheels/` keyed by commit + CUDA + arch list. Set `VVM_FLASHINFER_BUILD=1` to force the source build for a release ref.
 
 **`deepep`** downloads NVSHMEM from NVIDIA's CDN into `~/.vvm/cache/nvshmem/` (reused across installs), auto-detects your GPU arch for `TORCH_CUDA_ARCH_LIST`, and installs DeepEP against it. Multi-node IBGDA still needs a one-time `sudo` driver config step (vvm prints instructions after install).
 

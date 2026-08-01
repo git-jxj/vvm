@@ -16,7 +16,9 @@ pub enum VvmError {
     #[error("Version not found: {0}")]
     VersionNotFound(String),
 
-    #[error("No current version set. Use `vvm use <version>` first.")]
+    #[error(
+        "No active vllm version. Install one with `vvm install <version>`, or switch to an existing one with `vvm use <version>` (`vvm ls` lists them)."
+    )]
     NoCurrentVersion,
 
     #[error("GitHub API error: {0}")]

@@ -95,30 +95,37 @@ fn clone_at_ref(
     Ok(src)
 }
 
-/// Vendored fallback when we can't read the active vllm's pin (no current
-/// version, offline, or older vllm without `tools/install_deepgemm.sh`).
+/// Vendored fallbacks for when we can't read the active vllm's pin (no current
+/// version, offline, or a vllm predating the file the pin lives in).
 const FALLBACK_DEEPGEMM_REF: &str = "477618cd51baffca09c4b0b87e97c03fe827ef03";
+const FALLBACK_DEEPEP_REF: &str = "73b6ea4";
+const FALLBACK_FLASHINFER_REF: &str = "main";
 
-/// Read `tools/install_deepgemm.sh` from the currently-active vllm and pull
-/// out the `DEEPGEMM_GIT_REF=...` value. Source-of-truth order:
+/// Where a pinned ref came from, for the `[pin: ...]` line at install time.
+/// Worth surfacing: "active vllm" and "bundled fallback" can differ by months,
+/// and that difference is exactly what breaks a build.
+const PIN_FROM_USER: &str = "user";
+const PIN_FROM_VLLM: &str = "active vllm";
+const PIN_FROM_FALLBACK: &str = "bundled fallback";
+
+/// Read a file out of the currently-active vllm. Source-of-truth order:
 ///   1. Local source tree (`source_path` from metadata) — covers `--path` /
 ///      `--source` / `--compile` installs and works offline.
 ///   2. raw.githubusercontent.com at the install's commit (or release tag) —
-///      covers wheel-based installs where `tools/` isn't shipped.
+///      covers wheel-based installs, where only the Python package ships and
+///      `tools/` + `docker/` are absent.
 ///
-/// Returns None on any failure; caller falls back to the vendored default.
-fn resolve_deepgemm_ref_from_active_vllm(config: &Config) -> Option<String> {
+/// Returns None on any failure; callers fall back to a vendored default.
+fn read_file_from_active_vllm(config: &Config, rel_path: &str) -> Option<String> {
     let link = config.current_link();
     let target = std::fs::read_link(&link).ok()?;
     let meta = VersionMetadata::load(&target).ok()?;
 
     if let Some(sp) = &meta.source_path {
-        let local = Path::new(sp).join("tools/install_deepgemm.sh");
+        let local = Path::new(sp).join(rel_path);
         if local.is_file() {
             if let Ok(text) = std::fs::read_to_string(&local) {
-                if let Some(sha) = parse_deepgemm_git_ref(&text) {
-                    return Some(sha);
-                }
+                return Some(text);
             }
         }
     }
@@ -135,8 +142,8 @@ fn resolve_deepgemm_ref_from_active_vllm(config: &Config) -> Option<String> {
     })?;
 
     let url = format!(
-        "https://raw.githubusercontent.com/vllm-project/vllm/{}/tools/install_deepgemm.sh",
-        github_ref
+        "https://raw.githubusercontent.com/vllm-project/vllm/{}/{}",
+        github_ref, rel_path
     );
     let client = reqwest::blocking::Client::builder()
         .user_agent("vvm/0.1.0")
@@ -147,8 +154,99 @@ fn resolve_deepgemm_ref_from_active_vllm(config: &Config) -> Option<String> {
     if !resp.status().is_success() {
         return None;
     }
-    let text = resp.text().ok()?;
+    resp.text().ok()
+}
+
+/// Read `tools/install_deepgemm.sh` from the active vllm and pull out the
+/// `DEEPGEMM_GIT_REF=...` value.
+fn resolve_deepgemm_ref_from_active_vllm(config: &Config) -> Option<String> {
+    let text = read_file_from_active_vllm(config, "tools/install_deepgemm.sh")?;
     parse_deepgemm_git_ref(&text)
+}
+
+/// Read a pinned version out of the active vllm's `docker/versions.json`.
+///
+/// That file is auto-generated from the Dockerfile's `ARG` defaults and is
+/// vllm's own centralized version manifest — the same source its release
+/// images build from. Keys look like `DEEPEP_COMMIT_HASH`, `FLASHINFER_VERSION`.
+fn resolve_versions_json_pin(config: &Config, key: &str) -> Option<String> {
+    let text = read_file_from_active_vllm(config, "docker/versions.json")?;
+    parse_versions_json_pin(&text, key)
+}
+
+/// True when a string is plausibly a git object name rather than a version.
+/// Short SHAs start with a digit as often as not (`73b6ea4`), so "starts with
+/// a digit" alone can't tell the two apart — a dot is what a version has and
+/// a SHA never does.
+fn looks_like_sha(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Turn a release version into its conventional `v`-prefixed git tag.
+///
+/// vllm pins `FLASHINFER_VERSION=0.6.15.post1`; flashinfer tags that commit
+/// `v0.6.15.post1`. Anything already ref-shaped — leading `v`, a SHA, a branch
+/// name — is passed through untouched.
+fn version_to_tag(version: &str) -> String {
+    let v = version.trim();
+    let is_version = v.starts_with(|c: char| c.is_ascii_digit()) && v.contains('.');
+    if !is_version || looks_like_sha(v) {
+        return v.to_string();
+    }
+    format!("v{}", v)
+}
+
+/// Resolve what the user meant by `--ref <release version>`.
+///
+/// People name a flashinfer release `0.6.7`; upstream tags it `v0.6.7`, and a
+/// bare `0.6.7` dies at `git checkout` with an unhelpful pathspec error. Probe
+/// the literal ref first — a fork may well tag without the prefix, and that
+/// must keep working — and only then try the `v`-prefixed form.
+///
+/// Returns Some(rewritten) only when the literal ref is unresolvable and the
+/// prefixed one exists. Anything ls-remote can't see (short SHAs especially)
+/// is left alone for the post-checkout resolution to handle.
+fn resolve_versionish_ref(repo: &str, git_ref: &str) -> Option<String> {
+    let tagged = version_to_tag(git_ref);
+    if tagged == git_ref {
+        return None;
+    }
+    if resolve_remote_sha(repo, git_ref).is_some() {
+        return None;
+    }
+    resolve_remote_sha(repo, &tagged).map(|_| tagged)
+}
+
+/// Take `--ref` as the user gave it, rewriting a bare release version to the
+/// `v`-prefixed tag when that's the only form the repo actually carries.
+/// Costs nothing for the common cases — a SHA or branch name never reaches the
+/// network probe.
+fn user_ref(repo: &str, git_ref: &str) -> String {
+    match resolve_versionish_ref(repo, git_ref) {
+        Some(tagged) => {
+            eprintln!(
+                "  {} '{}' isn't a ref in {} — using tag {}",
+                "note:".blue().bold(),
+                git_ref,
+                repo,
+                tagged.yellow()
+            );
+            tagged
+        }
+        None => git_ref.to_string(),
+    }
+}
+
+/// Extract `.variable.<key>.default` from a bake-style versions.json.
+fn parse_versions_json_pin(text: &str, key: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let value = json.get("variable")?.get(key)?.get("default")?.as_str()?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// Parse `DEEPGEMM_GIT_REF=<sha>` (with optional single/double quotes) from a
@@ -179,16 +277,16 @@ fn install_deepgemm(
 
     let repo = repo_override.unwrap_or("https://github.com/deepseek-ai/DeepGEMM.git");
     let (git_ref_owned, ref_source) = if let Some(r) = git_ref {
-        (r.to_string(), "user")
+        (user_ref(repo, r), PIN_FROM_USER)
     } else {
         match resolve_deepgemm_ref_from_active_vllm(config) {
-            Some(r) => (r, "active vllm"),
+            Some(r) => (r, PIN_FROM_VLLM),
             None => {
                 eprintln!(
                     "  {} couldn't read DeepGEMM pin from active vllm — falling back to vvm's bundled default",
                     "warning:".yellow().bold()
                 );
-                (FALLBACK_DEEPGEMM_REF.to_string(), "bundled fallback")
+                (FALLBACK_DEEPGEMM_REF.to_string(), PIN_FROM_FALLBACK)
             }
         }
     };
@@ -276,13 +374,33 @@ fn install_flashinfer(
     }
 
     let repo = repo_override.unwrap_or("https://github.com/flashinfer-ai/flashinfer.git");
-    let git_ref = git_ref.unwrap_or("main");
+    // Follow the active vllm's FLASHINFER_VERSION. vllm pins a PyPI version
+    // ("0.6.15.post1"); upstream tags the matching commit "v0.6.15.post1", so
+    // the version maps straight onto a git ref. Pinning also makes the wheel
+    // cache actually hit — `main` moves, a tag doesn't.
+    let (git_ref_owned, ref_source) = if let Some(r) = git_ref {
+        (user_ref(repo, r), PIN_FROM_USER)
+    } else {
+        match resolve_versions_json_pin(config, "FLASHINFER_VERSION").map(|v| version_to_tag(&v)) {
+            Some(r) => (r, PIN_FROM_VLLM),
+            None => {
+                eprintln!(
+                    "  {} couldn't read FlashInfer pin from active vllm — falling back to {}",
+                    "warning:".yellow().bold(),
+                    FALLBACK_FLASHINFER_REF
+                );
+                (FALLBACK_FLASHINFER_REF.to_string(), PIN_FROM_FALLBACK)
+            }
+        }
+    };
+    let git_ref: &str = &git_ref_owned;
 
     println!(
-        "{} FlashInfer ({} @ {})",
+        "{} FlashInfer ({} @ {}) [pin: {}]",
         "Installing".green().bold(),
         repo.cyan(),
-        git_ref.yellow()
+        git_ref.yellow(),
+        ref_source.blue()
     );
 
     // CUDA-version-gated arch list matches vllm's tools/flashinfer-build.sh.
@@ -298,7 +416,30 @@ fn install_flashinfer(
 
     let spinner = make_spinner();
 
-    // Fast path: the ref resolves to a commit we've already built a wheel for
+    // Fastest path: a released version needs no build at all. flashinfer-python
+    // publishes a py3-none-any wheel to PyPI — the CUDA-specific kernels live
+    // in the cubin/jit-cache companions, which get installed right after either
+    // way. Compiling is only genuinely required for a branch, a raw commit, or
+    // a fork, so don't spend 10-20 minutes reproducing a published artifact.
+    if repo_override.is_none() && std::env::var("VVM_FLASHINFER_BUILD").is_err() {
+        if let Some(version) = release_version_from_ref(git_ref) {
+            match install_flashinfer_release(venv_path, &version, &spinner) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // A tag that never shipped to PyPI (rc pulled, yanked
+                    // release) — fall back to building it from source.
+                    spinner.println(format!(
+                        "  {} no published wheel for flashinfer-python {} ({}) — building from source",
+                        "Note:".yellow().bold(),
+                        version,
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    // Next: the ref resolves to a commit we've already built a wheel for
     // (same CUDA variant + arch list) — install it without cloning anything.
     // The wheel is py3-none-any (kernels ship as cubin/JIT data, no torch-ABI
     // binding), so one build serves every version's venv.
@@ -391,6 +532,59 @@ fn install_flashinfer(
     }
 
     install_flashinfer_from_wheel(venv_path, &wheel, &spinner, "built")
+}
+
+/// The PyPI version a ref names, if it names one at all.
+///
+/// `v0.6.15.post1` and `0.6.15.post1` both mean the released package; `main`,
+/// a SHA, or any other branch name means "whatever that tree contains", which
+/// only a source build can produce.
+fn release_version_from_ref(git_ref: &str) -> Option<String> {
+    let v = git_ref.strip_prefix('v').unwrap_or(git_ref);
+    if looks_like_sha(v) || !is_published_release_version(v) {
+        return None;
+    }
+    // A release is at least `<major>.<minor>`; a bare `1` is a branch name.
+    if !v.contains('.') {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// Install a released flashinfer-python straight from PyPI, then its
+/// companions. No clone, no compile — seconds instead of tens of minutes.
+fn install_flashinfer_release(
+    venv_path: &Path,
+    version: &str,
+    spinner: &ProgressBar,
+) -> Result<(), VvmError> {
+    let bin_dir = venv_path.join("bin");
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", bin_dir.display(), current_path);
+
+    spinner.set_message(format!(
+        "Installing prebuilt flashinfer-python {} ...",
+        version
+    ));
+    // --pre so rc tags resolve; pinned exactly, so it can't drift to another.
+    run_checked(
+        Command::new("uv")
+            .args(["pip", "install", "--pre"])
+            .arg(format!("flashinfer-python=={}", version))
+            .env("PATH", &new_path)
+            .env("VIRTUAL_ENV", venv_path),
+        "uv pip install flashinfer-python",
+    )?;
+
+    spinner.println(format!(
+        "  {} flashinfer-python {} (prebuilt, no compile)",
+        "Wheel:".blue().bold(),
+        version
+    ));
+    install_flashinfer_companion_caches(venv_path, spinner)?;
+    spinner.finish_and_clear();
+    println!("{} FlashInfer installed", "✓".green().bold());
+    Ok(())
 }
 
 /// Install a flashinfer wheel file into the venv, then pull the companion
@@ -520,12 +714,18 @@ fn pkg_version(python: &Path, dist: &str) -> Option<String> {
 /// True for plain release versions like "0.6.7" — the only shape that has
 /// matching wheels on PyPI and flashinfer.ai/whl. Source builds off main
 /// yield dev versions like "0.7.0.dev0+abc123" which won't resolve.
-fn is_plain_release_version(v: &str) -> bool {
-    let parts: Vec<&str> = v.split('.').collect();
-    !parts.is_empty()
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+/// True for a version the companion indexes could plausibly carry a wheel for.
+///
+/// Excludes only what never gets published: a PEP 440 local label (`+g1a2b3c4`,
+/// which is what a source build stamps on) and `.devN`. `.postN` and `rcN` are
+/// ordinary published releases — flashinfer ships jit-cache wheels for both
+/// (`0.6.8.post1`, `0.6.9rc1`), and an all-digits-only test misread them as dev
+/// builds and silently skipped the companions.
+fn is_published_release_version(v: &str) -> bool {
+    !v.is_empty()
+        && v.starts_with(|c: char| c.is_ascii_digit())
+        && !v.contains('+')
+        && !v.contains(".dev")
 }
 
 /// Install flashinfer-cubin + flashinfer-jit-cache at the version that was
@@ -556,7 +756,7 @@ fn install_flashinfer_companion_caches(
         other => Some(other.as_str().to_string()),
     };
 
-    if is_plain_release_version(&version) {
+    if is_published_release_version(&version) {
         let Some(cu_tag) = cu_tag else {
             spinner.println(format!(
                 "  {} CPU build detected — skipping flashinfer-jit-cache (no CPU wheel)",
@@ -565,44 +765,89 @@ fn install_flashinfer_companion_caches(
             remove_stale_flashinfer_companions(&python, venv_path, &version, spinner);
             return Ok(());
         };
-        let jit_index = format!("https://flashinfer.ai/whl/{}", cu_tag);
-
-        spinner.set_message(format!(
-            "Installing flashinfer-cubin + flashinfer-jit-cache {} ({}) ...",
-            version, cu_tag
-        ));
-
         let bin_dir = venv_path.join("bin");
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{}", bin_dir.display(), current_path);
 
-        // Single uv pip invocation: cubin from PyPI, jit-cache from flashinfer.ai.
-        // --extra-index-url keeps PyPI as the primary resolver.
-        let cubin_spec = format!("flashinfer-cubin=={}", version);
-        let jit_spec = format!("flashinfer-jit-cache=={}", version);
-        let result = run_checked(
+        // The two companions are not equivalent and must not share one uv
+        // invocation — a miss on the optional one would take the required one
+        // down with it.
+        //
+        // flashinfer-cubin is a *vllm* runtime requirement (requirements/cuda.txt
+        // pins it alongside flashinfer-python). It left PyPI at 0.6.14 and now
+        // lives only on flashinfer.ai's root index — which is why vllm's
+        // setup.py strips it from install_requires: a published wheel can't
+        // carry a pin nothing on PyPI resolves. Both indexes are offered so
+        // pre-0.6.14 versions still resolve from PyPI.
+        spinner.set_message(format!("Installing flashinfer-cubin {} ...", version));
+        let cubin_ok = run_checked(
             Command::new("uv")
-                .args(["pip", "install", "--extra-index-url", &jit_index])
-                .arg(&cubin_spec)
-                .arg(&jit_spec)
+                .args([
+                    "pip",
+                    "install",
+                    "--extra-index-url",
+                    "https://flashinfer.ai/whl/",
+                ])
+                .arg(format!("flashinfer-cubin=={}", version))
                 .env("PATH", &new_path)
                 .env("VIRTUAL_ENV", venv_path),
-            "uv pip install flashinfer cubin+jit-cache",
-        );
-        if result.is_ok() {
+            "uv pip install flashinfer-cubin",
+        )
+        .is_ok();
+        if cubin_ok {
             spinner.println(format!(
-                "  {} flashinfer-cubin + flashinfer-jit-cache {} ({})",
-                "Cache packages installed:".blue().bold(),
-                version,
-                cu_tag
+                "  {} flashinfer-cubin {}",
+                "Installed:".blue().bold(),
+                version
             ));
-            return Ok(());
+        } else {
+            spinner.println(format!(
+                "  {} no flashinfer-cubin wheel for {} — cubins will download on demand",
+                "Warning:".yellow().bold(),
+                version
+            ));
         }
-        spinner.println(format!(
-            "  {} no flashinfer-cubin / flashinfer-jit-cache wheels for {} — cubins will download on demand",
-            "Skipping companion caches:".blue().bold(),
-            version
-        ));
+
+        // flashinfer-jit-cache is a prebuilt JIT cache, CUDA-and-arch specific
+        // and ~1.4 GB. vllm installs it in its Dockerfile but does not list it
+        // as a requirement — it buys startup latency, not correctness. Failing
+        // to get it is a warning, never an error.
+        if std::env::var("VVM_FLASHINFER_NO_JIT_CACHE").is_ok() {
+            spinner.println(format!(
+                "  {} flashinfer-jit-cache (VVM_FLASHINFER_NO_JIT_CACHE) — kernels JIT on first use",
+                "Skipping:".blue().bold()
+            ));
+        } else {
+            let jit_index = format!("https://flashinfer.ai/whl/{}", cu_tag);
+            spinner.set_message(format!(
+                "Installing flashinfer-jit-cache {} ({}, ~1.4 GB) ...",
+                version, cu_tag
+            ));
+            let jit_ok = run_checked(
+                Command::new("uv")
+                    .args(["pip", "install", "--extra-index-url", &jit_index])
+                    .arg(format!("flashinfer-jit-cache=={}", version))
+                    .env("PATH", &new_path)
+                    .env("VIRTUAL_ENV", venv_path),
+                "uv pip install flashinfer-jit-cache",
+            )
+            .is_ok();
+            spinner.println(if jit_ok {
+                format!(
+                    "  {} flashinfer-jit-cache {} ({})",
+                    "Installed:".blue().bold(),
+                    version,
+                    cu_tag
+                )
+            } else {
+                format!(
+                    "  {} no flashinfer-jit-cache wheel for {} ({}) — kernels JIT on first use",
+                    "Warning:".yellow().bold(),
+                    version,
+                    cu_tag
+                )
+            });
+        }
     } else {
         spinner.println(format!(
             "  {} flashinfer is a dev build ({}); no matching flashinfer-cubin / flashinfer-jit-cache wheels",
@@ -660,8 +905,23 @@ fn install_deepep(
     require_cuda_at_least(12, 8)?;
 
     let repo = repo_override.unwrap_or("https://github.com/deepseek-ai/DeepEP.git");
-    // Matches vllm docker/Dockerfile DEEPEP_COMMIT_HASH. Override with --ref main for latest.
-    let git_ref = git_ref.unwrap_or("73b6ea4");
+    // Follow the active vllm's DEEPEP_COMMIT_HASH — the same pin its release
+    // images build from. Override with --ref main for latest.
+    let (git_ref_owned, ref_source) = if let Some(r) = git_ref {
+        (user_ref(repo, r), PIN_FROM_USER)
+    } else {
+        match resolve_versions_json_pin(config, "DEEPEP_COMMIT_HASH") {
+            Some(r) => (r, PIN_FROM_VLLM),
+            None => {
+                eprintln!(
+                    "  {} couldn't read DeepEP pin from active vllm — falling back to vvm's bundled default",
+                    "warning:".yellow().bold()
+                );
+                (FALLBACK_DEEPEP_REF.to_string(), PIN_FROM_FALLBACK)
+            }
+        }
+    };
+    let git_ref: &str = &git_ref_owned;
     // NVSHMEM 3.3.24 ships both CUDA 12 and 13 tarballs. Override via env for pre-releases.
     let nvshmem_ver = std::env::var("VVM_NVSHMEM_VER").unwrap_or_else(|_| "3.3.24".to_string());
     // Mirror the shell script's path-traversal guard — this string goes into a URL and a filename.
@@ -697,10 +957,11 @@ fn install_deepep(
     };
 
     println!(
-        "{} DeepEP ({} @ {})",
+        "{} DeepEP ({} @ {}) [pin: {}]",
         "Installing".green().bold(),
         repo.cyan(),
-        git_ref.yellow()
+        git_ref.yellow(),
+        ref_source.blue()
     );
     println!(
         "  {} NVSHMEM {} for {} (CUDA {})",
@@ -1227,7 +1488,11 @@ impl Drop for TempDir {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_deepgemm_git_ref, resolve_remote_sha, wheel_cache_dir};
+    use super::{
+        is_published_release_version, looks_like_sha, parse_deepgemm_git_ref,
+        parse_versions_json_pin, release_version_from_ref, resolve_remote_sha, version_to_tag,
+        wheel_cache_dir,
+    };
     use crate::config::Config;
     use crate::cuda::CudaVariant;
 
@@ -1293,5 +1558,113 @@ git checkout "$DEEPGEMM_GIT_REF"
     #[test]
     fn returns_none_when_missing() {
         assert_eq!(parse_deepgemm_git_ref("echo hi\n"), None);
+    }
+
+    /// Shape of vllm's real docker/versions.json (auto-generated from the
+    /// Dockerfile's ARG defaults), trimmed to the keys vvm reads.
+    const VERSIONS_JSON: &str = r#"{
+      "_comment": "Auto-generated from Dockerfile ARGs. Do not edit manually.",
+      "variable": {
+        "CUDA_VERSION": { "default": "13.0.3" },
+        "DEEPEP_COMMIT_HASH": { "default": "d4f41e4e93" },
+        "FLASHINFER_VERSION": { "default": "0.6.15.post1" },
+        "NVSHMEM_VER": { "default": "" }
+      }
+    }"#;
+
+    #[test]
+    fn reads_pins_from_versions_json() {
+        assert_eq!(
+            parse_versions_json_pin(VERSIONS_JSON, "DEEPEP_COMMIT_HASH").as_deref(),
+            Some("d4f41e4e93")
+        );
+        assert_eq!(
+            parse_versions_json_pin(VERSIONS_JSON, "FLASHINFER_VERSION").as_deref(),
+            Some("0.6.15.post1")
+        );
+    }
+
+    #[test]
+    fn versions_json_misses_are_none_not_panics() {
+        // Key absent (older vllm predating the ARG), empty default (ARG with
+        // no value), and a file that isn't versions.json at all.
+        assert_eq!(parse_versions_json_pin(VERSIONS_JSON, "NOPE_VERSION"), None);
+        assert_eq!(parse_versions_json_pin(VERSIONS_JSON, "NVSHMEM_VER"), None);
+        assert_eq!(
+            parse_versions_json_pin("not json", "DEEPEP_COMMIT_HASH"),
+            None
+        );
+        assert_eq!(parse_versions_json_pin("{}", "DEEPEP_COMMIT_HASH"), None);
+    }
+
+    #[test]
+    fn version_maps_to_upstream_tag() {
+        assert_eq!(version_to_tag("0.6.15.post1"), "v0.6.15.post1");
+        assert_eq!(version_to_tag("0.6.8"), "v0.6.8");
+        assert_eq!(version_to_tag("0.6.15rc4"), "v0.6.15rc4");
+        // Already a ref — don't double-prefix.
+        assert_eq!(version_to_tag("v0.6.9"), "v0.6.9");
+        assert_eq!(version_to_tag("main"), "main");
+    }
+
+    #[test]
+    fn digit_leading_shas_are_never_treated_as_versions() {
+        // The trap: a short SHA can start with a digit just like a version.
+        // Prefixing one with `v` would produce a ref that resolves to nothing.
+        assert_eq!(version_to_tag("73b6ea4"), "73b6ea4");
+        assert_eq!(version_to_tag("d4f41e4e93"), "d4f41e4e93");
+        assert_eq!(
+            version_to_tag("477618cd51baffca09c4b0b87e97c03fe827ef03"),
+            "477618cd51baffca09c4b0b87e97c03fe827ef03"
+        );
+    }
+
+    #[test]
+    fn post_and_rc_releases_are_published_versions() {
+        // Regression: an all-digits test read these as dev builds and skipped
+        // the cubin/jit-cache companions. flashinfer publishes wheels for both.
+        assert!(is_published_release_version("0.6.8"));
+        assert!(is_published_release_version("0.6.8.post1"));
+        assert!(is_published_release_version("0.6.15.post1"));
+        assert!(is_published_release_version("0.6.9rc1"));
+        // Genuinely unpublished: a source build's local label, or a dev cut.
+        assert!(!is_published_release_version("0.6.9+g1a2b3c4"));
+        assert!(!is_published_release_version("0.3.0.dev20260101"));
+        assert!(!is_published_release_version(""));
+    }
+
+    #[test]
+    fn release_refs_map_to_pypi_versions() {
+        assert_eq!(
+            release_version_from_ref("v0.6.15.post1").as_deref(),
+            Some("0.6.15.post1")
+        );
+        assert_eq!(release_version_from_ref("0.6.7").as_deref(), Some("0.6.7"));
+        assert_eq!(
+            release_version_from_ref("v0.6.9rc1").as_deref(),
+            Some("0.6.9rc1")
+        );
+        // Not a release — these can only come from a source build.
+        assert_eq!(release_version_from_ref("main"), None);
+        assert_eq!(release_version_from_ref("73b6ea4"), None);
+        assert_eq!(
+            release_version_from_ref("477618cd51baffca09c4b0b87e97c03fe827ef03"),
+            None
+        );
+        // No dot: a branch called "v2", not a version.
+        assert_eq!(release_version_from_ref("v2"), None);
+    }
+
+    #[test]
+    fn sha_detection_bounds() {
+        assert!(looks_like_sha("73b6ea4"));
+        assert!(looks_like_sha("477618cd51baffca09c4b0b87e97c03fe827ef03"));
+        // Too short to be a usable abbreviation, and a real word that happens
+        // to be all hex-ish must not pass.
+        assert!(!looks_like_sha("abc"));
+        assert!(!looks_like_sha("main"));
+        assert!(!looks_like_sha("0.6.15"));
+        // Over 40 chars is not an object name.
+        assert!(!looks_like_sha(&"a".repeat(41)));
     }
 }
