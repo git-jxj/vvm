@@ -186,7 +186,13 @@ vvm install-extra deepep --ref d4f41e4e93         # A specific commit
 vvm install-extra flashinfer --repo https://github.com/me/flashinfer-fork  # Your own fork
 ```
 
-`--ref` takes a commit SHA, tag, branch, or a bare release version. Upstream tags releases `v0.6.7` while everyone says "0.6.7", so vvm tries the literal ref first — a fork that tags without the prefix keeps working — and only falls back to the `v`-prefixed form, telling you when it does. SHAs are never rewritten.
+`--ref` takes a commit SHA, tag, branch, or a bare release version. Upstream tags releases `v0.6.7` while everyone says "0.6.7", so vvm tries the literal ref first — a fork that tags without the prefix keeps working — and only falls back to the `v`-prefixed form, telling you when it does. SHAs are never rewritten. A ref that exists nowhere in the repo fails immediately, with nearby tags listed, rather than after a clone:
+
+```
+$ vvm install-extra flashinfer --ref v0.67
+error: could not resolve 'v0.67' as a branch, tag, or commit in https://github.com/flashinfer-ai/flashinfer.git.
+       Close tags: v0.6.17rc1, v0.6.16rc5, v0.6.16rc4, v0.6.16rc3, v0.6.16rc2
+```
 
 **Version defaults follow the active vllm**, so an extra matches what that vllm was actually tested against rather than whatever upstream `main` happens to be today. `deepgemm` reads `DEEPGEMM_GIT_REF` from `tools/install_deepgemm.sh`; `deepep` and `flashinfer` read `DEEPEP_COMMIT_HASH` / `FLASHINFER_VERSION` from `docker/versions.json` — the manifest vllm's own release images build from. For `--path`/`--compile` installs the files are read straight from your source tree (works offline); for wheel installs they're fetched from GitHub at that install's commit or tag. Each install prints where its pin came from:
 
@@ -198,6 +204,19 @@ Installing DeepEP (https://github.com/deepseek-ai/DeepEP.git @ d4f41e4e93) [pin:
 `--ref` always wins, and a vendored default covers the cases where neither source is readable (offline, or a vllm predating the pin file).
 
 **`flashinfer`** installs prebuilt whenever it can. A release ref — including the default pin from vllm — comes straight from PyPI as a `py3-none-any` wheel, so it lands in seconds with no compile; `--ref nightly` pulls prebuilt nightly wheels from `flashinfer.ai/whl/nightly/`. Two companions are installed afterward, pinned to the same version (a mismatch makes flashinfer refuse to import). **`flashinfer-cubin`** is a vllm runtime requirement — `requirements/cuda.txt` pins it next to `flashinfer-python`, and since 0.6.14 it lives only on `flashinfer.ai/whl/`, not PyPI. **`flashinfer-jit-cache`** (~1.4 GB, CUDA- and arch-specific) is what vllm's Dockerfile adds on top; it buys startup latency, not correctness, so a miss is only a warning and `VVM_FLASHINFER_NO_JIT_CACHE=1` skips it — kernels then JIT on first use. Only a branch, a raw commit, or `--repo <fork>` actually needs a source build, which takes 10-20 minutes and is cached under `~/.vvm/cache/wheels/` keyed by commit + CUDA + arch list. Set `VVM_FLASHINFER_BUILD=1` to force the source build for a release ref.
+
+Every flashinfer install path ends with a verification step: `flashinfer show-config` runs inside the venv, exercising the import, torch, the CUDA runtime, and the cubin/jit-cache wiring, and the identity lines are surfaced so a mismatch is visible immediately instead of mid-inference:
+
+```
+  Verify: FlashInfer version: 0.6.17rc1
+  Verify: flashinfer-cubin version: 0.6.17rc1
+  Verify: flashinfer-jit-cache: 0.6.17rc1
+  Verify: Torch version: 2.11.0+cu130
+  Verify: CUDA runtime available: Yes
+✓ FlashInfer installed
+```
+
+A verification failure is a warning, not an error — show-config also talks to NVIDIA's cubin repository, and a network hiccup shouldn't fail wheels that are already installed. Run with `-v` to stream the full dump. Skipped on nodes without GPU access.
 
 **`deepep`** downloads NVSHMEM from NVIDIA's CDN into `~/.vvm/cache/nvshmem/` (reused across installs), auto-detects your GPU arch for `TORCH_CUDA_ARCH_LIST`, and installs DeepEP against it. Multi-node IBGDA still needs a one-time `sudo` driver config step (vvm prints instructions after install).
 

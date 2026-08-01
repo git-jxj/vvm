@@ -217,6 +217,119 @@ fn resolve_versionish_ref(repo: &str, git_ref: &str) -> Option<String> {
     resolve_remote_sha(repo, &tagged).map(|_| tagged)
 }
 
+/// Reject a ref that resolves nowhere, before anything expensive runs.
+///
+/// A typo like `--ref v0.67` (for `v0.6.7`) is version-shaped enough to look
+/// real: the PyPI probe misses, then a full clone runs only to die at
+/// `git checkout` with a bare pathspec error. "No published wheel" and "no such
+/// ref" need different answers — the first falls back to a source build, the
+/// second can only be a mistake.
+///
+/// Short SHAs are exempt: `ls-remote` genuinely cannot see them, and the
+/// existing post-checkout resolution already covers that case.
+///
+/// Returns the resolved SHA when ls-remote knew it, so callers don't re-probe.
+fn ensure_ref_exists(repo: &str, git_ref: &str) -> Result<Option<String>, VvmError> {
+    if looks_like_sha(git_ref) {
+        // A full 40-char SHA is its own resolution, no network needed — and it
+        // must stay resolved here or the wheel-cache fast path loses its key
+        // and pays for a clone. Shorter abbreviations stay None either way.
+        return Ok((git_ref.len() == 40).then(|| git_ref.to_ascii_lowercase()));
+    }
+    if let Some(sha) = resolve_remote_sha(repo, git_ref) {
+        return Ok(Some(sha));
+    }
+    Err(VvmError::InvalidSpecifier(format!(
+        "could not resolve '{}' as a branch, tag, or commit in {}{}",
+        git_ref,
+        repo,
+        suggest_similar_refs(repo, git_ref)
+    )))
+}
+
+/// Best-effort "did you mean" list for a ref that doesn't exist.
+fn suggest_similar_refs(repo: &str, git_ref: &str) -> String {
+    let Ok(output) = Command::new("git")
+        .args(["ls-remote", "--tags", repo])
+        .output()
+    else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let tags: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(_, name)| name.trim_end_matches("^{}"))
+        .filter_map(|name| name.strip_prefix("refs/tags/"))
+        .collect();
+    format_close_tags(&tags, git_ref)
+}
+
+/// Pure half of `suggest_similar_refs`, factored out so it's testable.
+///
+/// Walks back the query's own prefix until some tags match, so `v0.67` lands on
+/// the `v0.6*` family, then shows the newest five. Returns an empty string when
+/// nothing helpful turns up — a guess is a courtesy, never a reason to fail
+/// differently.
+fn format_close_tags(tags: &[&str], query: &str) -> String {
+    for take in (2..=query.len()).rev() {
+        // Byte positions; splitting mid-char would panic on non-ASCII input.
+        if !query.is_char_boundary(take) {
+            continue;
+        }
+        let prefix = &query[..take];
+        let mut hits: Vec<&str> = tags
+            .iter()
+            .copied()
+            .filter(|t| t.starts_with(prefix))
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        // Numeric-aware, newest first: plain lexicographic order buries every
+        // 0.x.1N release below 0.x.9, hiding exactly the tags worth suggesting.
+        hits.sort_unstable_by(|a, b| natural_order(b, a));
+        hits.dedup();
+        let shown: Vec<&str> = hits.into_iter().take(5).collect();
+        return format!(". Close tags: {}", shown.join(", "));
+    }
+    String::new()
+}
+
+/// Compare strings the way humans read versions: digit runs compare as
+/// numbers, everything else as text, so `v0.6.15` > `v0.6.9`.
+fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a, b);
+    loop {
+        if a.is_empty() || b.is_empty() {
+            return a.len().cmp(&b.len());
+        }
+        let (ra, rest_a) = split_leading_run(a);
+        let (rb, rest_b) = split_leading_run(b);
+        let ord = match (ra.parse::<u128>(), rb.parse::<u128>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => ra.cmp(rb),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+        (a, b) = (rest_a, rest_b);
+    }
+}
+
+/// Split off the leading run of digits, or of non-digits.
+fn split_leading_run(s: &str) -> (&str, &str) {
+    let digits = s.starts_with(|c: char| c.is_ascii_digit());
+    let end = s
+        .char_indices()
+        .find(|(_, c)| c.is_ascii_digit() != digits)
+        .map_or(s.len(), |(i, _)| i);
+    s.split_at(end)
+}
+
 /// Take `--ref` as the user gave it, rewriting a bare release version to the
 /// `v`-prefixed tag when that's the only form the repo actually carries.
 /// Costs nothing for the common cases — a SHA or branch name never reaches the
@@ -299,6 +412,9 @@ fn install_deepgemm(
         git_ref.yellow(),
         ref_source.blue()
     );
+
+    // Catch a mistyped ref before the spinner starts or the clone begins.
+    ensure_ref_exists(repo, git_ref)?;
 
     let spinner = make_spinner();
 
@@ -421,29 +537,37 @@ fn install_flashinfer(
     // in the cubin/jit-cache companions, which get installed right after either
     // way. Compiling is only genuinely required for a branch, a raw commit, or
     // a fork, so don't spend 10-20 minutes reproducing a published artifact.
+    let mut pypi_miss = None;
     if repo_override.is_none() && std::env::var("VVM_FLASHINFER_BUILD").is_err() {
         if let Some(version) = release_version_from_ref(git_ref) {
             match install_flashinfer_release(venv_path, &version, &spinner) {
                 Ok(()) => return Ok(()),
-                Err(e) => {
-                    // A tag that never shipped to PyPI (rc pulled, yanked
-                    // release) — fall back to building it from source.
-                    spinner.println(format!(
-                        "  {} no published wheel for flashinfer-python {} ({}) — building from source",
-                        "Note:".yellow().bold(),
-                        version,
-                        e
-                    ));
-                }
+                Err(_) => pypi_miss = Some(version),
             }
         }
+    }
+
+    // Only now pay for git. Deliberately after the PyPI attempt: a published
+    // release installs with zero ls-remote round-trips, and a version on PyPI
+    // whose tag was never pushed still installs. A PyPI miss splits two ways —
+    // a ref that exists (rc pulled, yanked release) falls back to the source
+    // build below; a ref that resolves nowhere is a typo, and dies here
+    // instead of after a full clone.
+    let resolved_sha =
+        ensure_ref_exists(repo, git_ref).inspect_err(|_| spinner.finish_and_clear())?;
+    if let Some(version) = pypi_miss {
+        spinner.println(format!(
+            "  {} no published wheel for flashinfer-python {} — building from source",
+            "Note:".yellow().bold(),
+            version
+        ));
     }
 
     // Next: the ref resolves to a commit we've already built a wheel for
     // (same CUDA variant + arch list) — install it without cloning anything.
     // The wheel is py3-none-any (kernels ship as cubin/JIT data, no torch-ABI
     // binding), so one build serves every version's venv.
-    let mut sha = resolve_remote_sha(repo, git_ref);
+    let mut sha = resolved_sha;
     if let Some(wheel) =
         cached_flashinfer_wheel(config, sha.as_deref(), &variant, arch_list.as_deref())
     {
@@ -582,6 +706,7 @@ fn install_flashinfer_release(
         version
     ));
     install_flashinfer_companion_caches(venv_path, spinner)?;
+    verify_flashinfer(venv_path, spinner);
     spinner.finish_and_clear();
     println!("{} FlashInfer installed", "✓".green().bold());
     Ok(())
@@ -625,6 +750,7 @@ fn install_flashinfer_from_wheel(
     // and CPU variants skip with a note.
     let _ = install_flashinfer_companion_caches(venv_path, spinner);
 
+    verify_flashinfer(venv_path, spinner);
     spinner.finish_and_clear();
     println!("{} FlashInfer installed", "✓".green().bold());
     Ok(())
@@ -684,11 +810,133 @@ fn install_flashinfer_nightly(venv_path: &Path) -> Result<(), VvmError> {
             .env("VIRTUAL_ENV", venv_path),
         "uv pip install flashinfer nightly",
     );
-    spinner.finish_and_clear();
+    if result.is_err() {
+        spinner.finish_and_clear();
+    }
     result?;
 
+    verify_flashinfer(venv_path, &spinner);
+    spinner.finish_and_clear();
     println!("{} FlashInfer nightly installed", "✓".green().bold());
     Ok(())
+}
+
+/// Post-install check: run `flashinfer show-config` inside the venv.
+///
+/// This exercises the entire load path — flashinfer's import, torch, the CUDA
+/// runtime, and the cubin/jit-cache wiring — and reports which versions
+/// actually landed, so a companion mismatch or broken import surfaces now
+/// instead of mid-inference. Failures are warnings, not errors: the wheels are
+/// already correctly installed, and show-config also reaches NVIDIA's cubin
+/// repository, so a network hiccup must not fail the install.
+///
+/// Skipped without GPU access (login nodes), same policy as vllm's own
+/// post-install verification.
+fn verify_flashinfer(venv_path: &Path, spinner: &ProgressBar) {
+    if !cuda::has_gpu_access() {
+        spinner.println(format!(
+            "  {} no GPU on this node — skipping `flashinfer show-config`",
+            "Verify:".blue().bold()
+        ));
+        return;
+    }
+
+    let bin_dir = venv_path.join("bin");
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", bin_dir.display(), current_path);
+
+    let cli = bin_dir.join("flashinfer");
+    let mut cmd = if cli.exists() {
+        let mut c = Command::new(&cli);
+        c.arg("show-config");
+        c
+    } else {
+        // Pre-CLI flashinfer: an import + version print still proves it loads.
+        let mut c = Command::new(bin_dir.join("python"));
+        c.args([
+            "-c",
+            "import flashinfer; print('FlashInfer version:', flashinfer.__version__)",
+        ]);
+        c
+    };
+    cmd.env("PATH", &new_path).env("VIRTUAL_ENV", venv_path);
+
+    spinner.set_message("Verifying installation (flashinfer show-config)...");
+
+    if std::env::var("VVM_VERBOSE").is_ok() {
+        // Stream the full dump (cubin fetches, module registration and all).
+        match cmd.status() {
+            Ok(s) if s.success() => {}
+            _ => spinner.println(format!(
+                "  {} `flashinfer show-config` failed — the install may not import cleanly",
+                "Warning:".yellow().bold()
+            )),
+        }
+        return;
+    }
+
+    match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let lines = summarize_show_config(&stdout);
+            if lines.is_empty() {
+                spinner.println(format!(
+                    "  {} flashinfer show-config OK",
+                    "Verify:".blue().bold()
+                ));
+            }
+            for l in lines {
+                spinner.println(format!("  {} {}", "Verify:".blue().bold(), l));
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let combined = if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
+            let tail: Vec<&str> = {
+                let mut t: Vec<&str> = combined.lines().rev().take(8).collect();
+                t.reverse();
+                t
+            };
+            spinner.println(format!(
+                "  {} `flashinfer show-config` failed — the install may not import cleanly:\n    {}",
+                "Warning:".yellow().bold(),
+                tail.join("\n    ")
+            ));
+        }
+        Err(e) => {
+            spinner.println(format!(
+                "  {} could not run flashinfer verification: {}",
+                "Warning:".yellow().bold(),
+                e
+            ));
+        }
+    }
+}
+
+/// Pick the identity lines out of `flashinfer show-config`'s dump.
+///
+/// The full output runs to hundreds of lines (checksum downloads, module
+/// registration); at install time only the version/torch/CUDA identity matters
+/// — that's where a companion mismatch or a wrong-variant torch shows up.
+fn summarize_show_config(stdout: &str) -> Vec<String> {
+    const KEYS: [&str; 5] = [
+        "FlashInfer version:",
+        "flashinfer-cubin",
+        "flashinfer-jit-cache",
+        "Torch version:",
+        "CUDA runtime available:",
+    ];
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| KEYS.iter().any(|k| l.starts_with(k)))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Installed version of a distribution in the venv via importlib.metadata.
@@ -711,9 +959,17 @@ fn pkg_version(python: &Path, dist: &str) -> Option<String> {
     }
 }
 
-/// True for plain release versions like "0.6.7" — the only shape that has
-/// matching wheels on PyPI and flashinfer.ai/whl. Source builds off main
-/// yield dev versions like "0.7.0.dev0+abc123" which won't resolve.
+/// A version with its PEP 440 local label dropped (`0.6.17rc1+cu130` →
+/// `0.6.17rc1`).
+///
+/// flashinfer-jit-cache encodes the CUDA variant there, so its installed
+/// version never equals flashinfer-python's as a plain string even when the
+/// pair is correctly matched. Comparing raw versions read a freshly installed
+/// jit-cache as stale and uninstalled it.
+fn public_version(v: &str) -> &str {
+    v.split_once('+').map(|(base, _)| base).unwrap_or(v)
+}
+
 /// True for a version the companion indexes could plausibly carry a wheel for.
 ///
 /// Excludes only what never gets published: a PEP 440 local label (`+g1a2b3c4`,
@@ -871,7 +1127,9 @@ fn remove_stale_flashinfer_companions(
 ) {
     let stale: Vec<&str> = ["flashinfer-cubin", "flashinfer-jit-cache"]
         .into_iter()
-        .filter(|dist| pkg_version(python, dist).is_some_and(|v| v != version))
+        .filter(|dist| {
+            pkg_version(python, dist).is_some_and(|v| public_version(&v) != public_version(version))
+        })
         .collect();
     if stale.is_empty() {
         return;
@@ -970,6 +1228,10 @@ fn install_deepep(
         nvshmem_subdir,
         cuda_major
     );
+
+    // Catch a mistyped ref before anything expensive — most of all the NVSHMEM
+    // download below (~350MB on a cache miss).
+    ensure_ref_exists(repo, git_ref)?;
 
     let spinner = make_spinner();
     let finish = |sp: &ProgressBar| sp.finish_and_clear();
@@ -1489,9 +1751,9 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_published_release_version, looks_like_sha, parse_deepgemm_git_ref,
-        parse_versions_json_pin, release_version_from_ref, resolve_remote_sha, version_to_tag,
-        wheel_cache_dir,
+        format_close_tags, is_published_release_version, looks_like_sha, natural_order,
+        parse_deepgemm_git_ref, parse_versions_json_pin, public_version, release_version_from_ref,
+        resolve_remote_sha, summarize_show_config, version_to_tag, wheel_cache_dir,
     };
     use crate::config::Config;
     use crate::cuda::CudaVariant;
@@ -1653,6 +1915,105 @@ git checkout "$DEEPGEMM_GIT_REF"
         );
         // No dot: a branch called "v2", not a version.
         assert_eq!(release_version_from_ref("v2"), None);
+    }
+
+    #[test]
+    fn local_label_does_not_make_a_companion_stale() {
+        // flashinfer-jit-cache stamps the CUDA variant into a PEP 440 local
+        // label; flashinfer-python and flashinfer-cubin carry none. Comparing
+        // raw strings read a correctly matched pair as a mismatch and
+        // uninstalled the good wheel.
+        assert_eq!(public_version("0.6.17rc1+cu130"), "0.6.17rc1");
+        assert_eq!(public_version("0.6.17rc1"), "0.6.17rc1");
+        assert_eq!(
+            public_version("0.6.17rc1+cu130"),
+            public_version("0.6.17rc1")
+        );
+        // A genuine mismatch still reads as one.
+        assert_ne!(public_version("0.6.16+cu130"), public_version("0.6.17rc1"));
+        // Differing CUDA variants of the same version are still a match — the
+        // variant is vvm's business, not a version skew.
+        assert_eq!(
+            public_version("0.6.17rc1+cu129"),
+            public_version("0.6.17rc1+cu130")
+        );
+    }
+
+    #[test]
+    fn close_tags_prefer_newest_and_survive_multibyte_queries() {
+        let tags = [
+            "v0.6.7",
+            "v0.6.8",
+            "v0.6.9",
+            "v0.6.9rc1",
+            "v0.6.15",
+            "v0.6.15.post1",
+            "v0.6.16",
+            "v0.6.17rc1",
+            "v1.0.0",
+        ];
+        // The typo the whole feature exists for: v0.67 → the v0.6* family,
+        // newest first. Lexicographic order buried v0.6.15+ below v0.6.9.
+        let s = format_close_tags(&tags, "v0.67");
+        let listed: Vec<&str> = s.trim_start_matches(". Close tags: ").split(", ").collect();
+        assert_eq!(
+            listed,
+            [
+                "v0.6.17rc1",
+                "v0.6.16",
+                "v0.6.15.post1",
+                "v0.6.15",
+                "v0.6.9rc1"
+            ]
+        );
+        // Byte-slicing the query must not panic mid-char (full-width digits).
+        let _ = format_close_tags(&tags, "v0.６７");
+        // Nothing plausible → stay silent.
+        assert_eq!(format_close_tags(&tags, "zz"), "");
+        assert_eq!(format_close_tags(&[], "v0.67"), "");
+    }
+
+    #[test]
+    fn natural_order_reads_digit_runs_as_numbers() {
+        use std::cmp::Ordering;
+        assert_eq!(natural_order("v0.6.15", "v0.6.9"), Ordering::Greater);
+        assert_eq!(natural_order("v0.6.9", "v0.6.9"), Ordering::Equal);
+        assert_eq!(natural_order("v0.6.9", "v0.6.9rc1"), Ordering::Less);
+        assert_eq!(natural_order("v0.10.0", "v0.9.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn show_config_summary_keeps_identity_lines_only() {
+        // Trimmed from a real `flashinfer show-config` run: the identity
+        // sections plus the noise around them (downloads, module counts).
+        let dump = "\
+=== Version Info ===
+FlashInfer version: 0.6.17rc1
+flashinfer-cubin version: 0.6.17rc1
+flashinfer-jit-cache: Not installed
+=== Torch Version Info ===
+Torch version: 2.11.0+cu130
+CUDA runtime available: Yes
+
+=== Environment Variables ===
+FLASHINFER_CACHE_DIR: /home/u/.cache/flashinfer
+2026-08-01 05:56:30,315 - INFO - cubin_loader.py:114 - flashinfer.jit: File downloaded successfully
+Downloaded 23090/23090 cubins
+Total modules: 792
+";
+        let got = summarize_show_config(dump);
+        assert_eq!(
+            got,
+            [
+                "FlashInfer version: 0.6.17rc1",
+                "flashinfer-cubin version: 0.6.17rc1",
+                "flashinfer-jit-cache: Not installed",
+                "Torch version: 2.11.0+cu130",
+                "CUDA runtime available: Yes",
+            ]
+        );
+        // Unrecognized format → empty, caller prints a plain OK instead.
+        assert!(summarize_show_config("something else entirely\n").is_empty());
     }
 
     #[test]
