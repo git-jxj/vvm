@@ -39,7 +39,7 @@ git config core.hooksPath .githooks
 - **`src/main.rs`** — CLI entry point. Clap derive-based command dispatch (14 subcommands + 1 hidden). `Cli` struct must be `pub` for clap_complete in init.rs. `Uninstall` takes `Vec<String>` for multi-version support. `exec_with_version` resolves `pip`/`pip3` to `uv pip` and falls back to `python -m {cmd}` for commands absent from `venv/bin`.
 - **`src/config.rs`** — `Config` struct managing `$VVM_DIR` paths (versions/, aliases/, repos/, cache/, current symlink).
 - **`src/errors.rs`** — `VvmError` enum via thiserror. All commands return `Result<(), VvmError>`.
-- **`src/cuda.rs`** — CUDA variant detection and `CudaVariant` enum (cu128/cu129/cu130/cpu). Detection order: `$VVM_CUDA_VARIANT` → nvidia-smi → `/usr/local/cuda/version.json` (or `$CUDA_HOME`) → `nvcc --version` → default cu129. `has_gpu_access()` checks nvidia-smi for login-node detection. `detect_gpu_arch_list()` queries nvidia-smi for compute capabilities (used by `--compile` to set `TORCH_CUDA_ARCH_LIST`).
+- **`src/cuda.rs`** — CUDA variant detection and `CudaVariant` enum (cu128/cu129/cu130/cpu). Detection order: `$VVM_CUDA_VARIANT` → nvidia-smi → `/usr/local/cuda/version.json` (or `$CUDA_HOME`) → `nvcc --version` → **cpu** when none of them report CUDA. A detected-but-unmapped major (CUDA 11 and older, or a future 14+) maps to the newest variant, cu130. `has_gpu_access()` checks nvidia-smi for login-node detection. `detect_gpu_arch_list()` queries nvidia-smi for compute capabilities (used by `--compile` to set `TORCH_CUDA_ARCH_LIST`).
 - **`src/venv.rs`** — Python venv creation via `uv venv` and command execution. `run_in_venv_with_env` for passing extra env vars (used by `--path` installs).
 - **`src/fsutil.rs`** — NFS-tolerant directory removal. `std::fs::remove_dir_all` can fail with ENOTEMPTY on NFS even after every entry is unlinked (stale attribute caches, `.nfs*` silly-rename files from another client). Renames the tree to a hidden sibling first — one atomic rename frees the caller's path immediately — then removes with retries.
 - **`src/metadata.rs`** — `VersionMetadata` (serde JSON) stored as `metadata.json` per installed version. Fields: type, name, version, commit, pr, branch, source_path, cuda, installed_at, arch_list (TORCH_CUDA_ARCH_LIST of compiled kernels; local-compiled installs only).
@@ -82,7 +82,7 @@ git config core.hooksPath .githooks
 ### Install Flow (commands/install.rs)
 
 1. Parse specifier → resolve commit hash if needed (GitHub API for branch/PR; short hashes expanded to full 40-char SHA)
-2. Detect CUDA variant (`--cuda` > `$VVM_CUDA_VARIANT` > nvidia-smi > version.json > nvcc > default cu129)
+2. Detect CUDA variant (`--cuda` > `$VVM_CUDA_VARIANT` > nvidia-smi > version.json > nvcc > cpu). Auto-detecting cpu prints a `Note:` — a silently CPU-only vllm otherwise surfaces much later, as a model that won't load.
 3. Create venv at `$VVM_DIR/versions/{name}/venv` via `uv venv`
 4. Install vllm via one of: `install_from_wheel`, `install_nightly_with_fallback`, `install_branch_with_fallback`, `install_from_local`, `install_from_local_compiled`, `install_from_source`, `install_from_pr`
 5. Verify installed variant (skip on login node); capture `vllm.__version__`

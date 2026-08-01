@@ -90,7 +90,25 @@ pub fn run(
     let cuda = match cuda_override {
         Some(v) => CudaVariant::from_str_loose(v)
             .ok_or_else(|| VvmError::UnsupportedVariant(v.to_string()))?,
-        None => CudaVariant::detect(),
+        None => {
+            let detected = CudaVariant::detect();
+            // Auto-detection landing on cpu means nothing here advertised CUDA.
+            // Say so — a silently CPU-only vllm is otherwise only discovered
+            // much later, when a model fails to load.
+            if matches!(detected, CudaVariant::Cpu) {
+                eprintln!(
+                    "{} no CUDA detected (nvidia-smi, /usr/local/cuda/version.json, nvcc) — installing the {} build.",
+                    "Note:".yellow().bold(),
+                    "cpu".yellow()
+                );
+                eprintln!(
+                    "      Pass {} or set {} to target a GPU build from this host.",
+                    "--cuda cu130".cyan(),
+                    "$VVM_CUDA_VARIANT".cyan()
+                );
+            }
+            detected
+        }
     };
 
     // If --path is given, derive specifier from the local repo's git state

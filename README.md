@@ -133,6 +133,8 @@ vvm install 0.18.0 --cuda cpu        # CPU-only
 # Works on login nodes where nvidia-smi is unavailable
 ```
 
+When none of those report a CUDA version, vvm installs the **cpu** build and says so — a GPU wheel picked on no evidence would only fail later at import. On a host with no CUDA visible that will run somewhere with a GPU (a toolkit-less login node, a build container), pass `--cuda cu130` or set `$VVM_CUDA_VARIANT`.
+
 ### Manage versions
 
 ```bash

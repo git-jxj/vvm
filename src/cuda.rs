@@ -35,8 +35,14 @@ impl CudaVariant {
     ///
     /// Priority:
     /// 1. $VVM_CUDA_VARIANT env var
-    /// 2. nvidia-smi CUDA version
-    /// 3. Default to cu129
+    /// 2. Detected CUDA version (nvidia-smi → version.json → nvcc)
+    /// 3. Fall back to cpu
+    ///
+    /// Falling back to cpu — rather than guessing a CUDA variant — keeps the
+    /// install honest: nothing on this machine advertises CUDA, so a GPU wheel
+    /// would only fail later at import. Override with `--cuda` or
+    /// `$VVM_CUDA_VARIANT` when building on a host that has no CUDA visible
+    /// but will run on one that does.
     pub fn detect() -> Self {
         // 1. Env var override
         if let Ok(v) = std::env::var("VVM_CUDA_VARIANT") {
@@ -45,13 +51,13 @@ impl CudaVariant {
             }
         }
 
-        // 2. nvidia-smi detection
+        // 2. nvidia-smi / version.json / nvcc detection
         if let Some(cuda_ver) = detect_cuda_version() {
             return map_cuda_version(&cuda_ver);
         }
 
-        // 3. Default
-        Self::Cu129
+        // 3. No CUDA found anywhere
+        Self::Cpu
     }
 }
 
@@ -248,16 +254,25 @@ fn format_arch_list(archs: &BTreeSet<String>, with_ptx: bool) -> String {
 }
 
 /// Map a CUDA version string like "12.8" to the nearest supported variant.
+///
+/// A string we can't parse a major version out of counts as "no CUDA
+/// identified" and maps to cpu — guessing a variant here would install a GPU
+/// wheel on evidence we don't actually have.
 fn map_cuda_version(ver: &str) -> CudaVariant {
     let parts: Vec<&str> = ver.split('.').collect();
-    let major: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(12);
+    let Some(major) = parts.first().and_then(|s| s.parse::<u32>().ok()) else {
+        return CudaVariant::Cpu;
+    };
     let minor: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     match (major, minor) {
-        (13, _) => CudaVariant::Cu130,
         (12, m) if m >= 9 => CudaVariant::Cu129,
         (12, _) => CudaVariant::Cu128,
-        _ => CudaVariant::Cu129,
+        // CUDA 13, future majors, and anything older than 12 all land on the
+        // newest supported variant. For a future major that's the closest
+        // thing we have; for CUDA 11 nothing would work anyway (vllm ships no
+        // cu11x wheel), so failing against the newest is the honest outcome.
+        _ => CudaVariant::Cu130,
     }
 }
 
@@ -319,6 +334,44 @@ mod tests {
         // unparseable / empty → not covered.
         assert!(!arch_list_covers("", "9.0"));
         assert!(!arch_list_covers("9.0", ""));
+    }
+
+    #[test]
+    fn unidentifiable_cuda_version_maps_to_cpu() {
+        // No parseable major version — we never actually identified CUDA.
+        assert_eq!(map_cuda_version(""), CudaVariant::Cpu);
+        assert_eq!(map_cuda_version("unknown"), CudaVariant::Cpu);
+        assert_eq!(map_cuda_version("N/A"), CudaVariant::Cpu);
+        assert_eq!(map_cuda_version("Not Supported"), CudaVariant::Cpu);
+    }
+
+    #[test]
+    fn known_cuda_versions_still_map_to_gpu_variants() {
+        assert_eq!(map_cuda_version("13.1"), CudaVariant::Cu130);
+        assert_eq!(map_cuda_version("12.9"), CudaVariant::Cu129);
+        assert_eq!(map_cuda_version("12.10"), CudaVariant::Cu129);
+        assert_eq!(map_cuda_version("12.8"), CudaVariant::Cu128);
+        // Bare major with no minor is still an identification.
+        assert_eq!(map_cuda_version("13"), CudaVariant::Cu130);
+    }
+
+    #[test]
+    fn unmapped_cuda_majors_fall_back_to_newest_variant() {
+        // Future majors get the newest variant we know about, never an older
+        // one than CUDA 13 receives.
+        assert_eq!(map_cuda_version("14.0"), CudaVariant::Cu130);
+        assert_eq!(map_cuda_version("99.9"), CudaVariant::Cu130);
+        // Pre-12 majors have no matching vllm wheel at all; newest is as good
+        // a target as any.
+        assert_eq!(map_cuda_version("11.8"), CudaVariant::Cu130);
+    }
+
+    #[test]
+    fn detect_falls_back_to_cpu_when_env_override_is_absent_and_bogus() {
+        // A bogus $VVM_CUDA_VARIANT is ignored, not fatal; detection continues
+        // and — on a host with no CUDA — ends at cpu rather than guessing.
+        assert!(CudaVariant::from_str_loose("cu999").is_none());
+        assert_eq!(CudaVariant::from_str_loose("cpu"), Some(CudaVariant::Cpu));
     }
 
     #[test]
