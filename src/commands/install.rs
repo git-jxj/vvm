@@ -147,7 +147,7 @@ pub fn run(
                 | Ok(VersionSpecifier::Pr(_))
                 | Ok(VersionSpecifier::Nightly)
         );
-        if raw_dir.exists() && !is_dynamic_spec {
+        if raw_dir.exists() && !is_dynamic_spec && !reclaim_abandoned_install(&raw_dir, spec_str)? {
             if !force {
                 return auto_use(config, spec_str, &raw_dir);
             }
@@ -200,41 +200,32 @@ pub fn run(
                 dir_name.cyan()
             );
             remove_dir_all_robust(&version_dir)?;
+        } else if reclaim_abandoned_install(&version_dir, &dir_name)? {
+            // Wreckage of an interrupted install — removed, fall through and
+            // install fresh in this same command.
+        } else if has_update(&specifier, &commit_hash, &version_dir) {
+            // Dynamic type (branch/pr/nightly) with a newer commit available.
+            let old_commit = VersionMetadata::load(&version_dir)
+                .ok()
+                .and_then(|m| m.commit);
+            let old_short = old_commit
+                .as_deref()
+                .map(|c| &c[..12.min(c.len())])
+                .unwrap_or("unknown");
+            let new_short = commit_hash
+                .as_deref()
+                .map(|c| &c[..12.min(c.len())])
+                .unwrap_or("latest");
+            println!(
+                "{} {} ({} → {}) ...",
+                "Updating".green().bold(),
+                dir_name.cyan(),
+                old_short,
+                new_short,
+            );
+            remove_dir_all_robust(&version_dir)?;
         } else {
-            // Detect stale lock from a crashed/interrupted install and auto-clean.
-            let lock_path = version_dir.join(".installing");
-            let meta_path = version_dir.join("metadata.json");
-            if lock_path.exists() && !meta_path.exists() && is_lock_stale(&lock_path) {
-                println!(
-                    "{} previous install of {} was interrupted, cleaning up...",
-                    "Warning:".yellow().bold(),
-                    dir_name.cyan()
-                );
-                remove_dir_all_robust(&version_dir)?;
-            } else if has_update(&specifier, &commit_hash, &version_dir) {
-                // Dynamic type (branch/pr/nightly) with a newer commit available.
-                let old_commit = VersionMetadata::load(&version_dir)
-                    .ok()
-                    .and_then(|m| m.commit);
-                let old_short = old_commit
-                    .as_deref()
-                    .map(|c| &c[..12.min(c.len())])
-                    .unwrap_or("unknown");
-                let new_short = commit_hash
-                    .as_deref()
-                    .map(|c| &c[..12.min(c.len())])
-                    .unwrap_or("latest");
-                println!(
-                    "{} {} ({} → {}) ...",
-                    "Updating".green().bold(),
-                    dir_name.cyan(),
-                    old_short,
-                    new_short,
-                );
-                remove_dir_all_robust(&version_dir)?;
-            } else {
-                return auto_use(config, &dir_name, &version_dir);
-            }
+            return auto_use(config, &dir_name, &version_dir);
         }
     }
 
@@ -552,6 +543,49 @@ pub fn run(
     Ok(())
 }
 
+/// Reclaim a version directory left behind by an interrupted install.
+///
+/// Two facts together make a directory provably dead: no `metadata.json` means
+/// the install never finished, and no live `.installing` lock means no process
+/// is going to finish it. vvm created the directory, nothing in it is the
+/// user's, and nobody owns it — so clean it up and let the caller install,
+/// rather than stopping to demand a `--force` re-run of the same command.
+///
+/// Returns true when the directory was removed.
+fn reclaim_abandoned_install(
+    version_dir: &std::path::Path,
+    dir_name: &str,
+) -> Result<bool, VvmError> {
+    // A completed install is never wreckage — check first so the common path
+    // costs one stat and never reaches the grace period below.
+    if version_dir.join("metadata.json").exists() {
+        return Ok(false);
+    }
+
+    let lock_path = version_dir.join(".installing");
+    // A live installer is briefly lockless, between its `create_dir` and its
+    // `File::create(".installing")`. Give the lock time to show up before
+    // calling the directory abandoned — same grace period as wait_for_install.
+    if !lock_path.exists() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while !lock_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    // Someone is actively installing (possibly on another node) — hands off.
+    if lock_path.exists() && !is_lock_stale(&lock_path) {
+        return Ok(false);
+    }
+
+    println!(
+        "{} previous install of {} was interrupted, cleaning up...",
+        "Warning:".yellow().bold(),
+        dir_name.cyan()
+    );
+    remove_dir_all_robust(version_dir)?;
+    Ok(true)
+}
+
 /// Auto-switch to an already-installed version instead of erroring.
 fn auto_use(
     config: &Config,
@@ -566,7 +600,7 @@ fn auto_use(
             return wait_for_install(config, version_dir, dir_name);
         }
         return Err(VvmError::InvalidSpecifier(format!(
-            "'{}' has a partial install (no metadata, no lock). Use --force to clean up and retry.",
+            "'{}' has a partial install (no metadata, no lock). Re-run the install to clean it up automatically.",
             dir_name
         )));
     }
@@ -629,7 +663,7 @@ fn wait_for_install(
     if !lock_path.exists() {
         // No lock and no metadata — a previous install crashed and left a partial directory.
         return Err(VvmError::InvalidSpecifier(format!(
-            "'{}' has a partial install (no metadata, no lock). Use --force to clean up and retry.",
+            "'{}' has a partial install (no metadata, no lock). Re-run the install to clean it up automatically.",
             dir_name
         )));
     }
