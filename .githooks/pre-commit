@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pre-commit hook: reject unformatted Rust code.
+# Install: git config core.hooksPath .githooks
+
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo ""
+    echo "ERROR: cargo fmt check failed. Run 'cargo fmt --all' and re-commit."
+    echo ""
+    exit 1
+fi
+
+if ! cargo sort --check -w 2>/dev/null; then
+    echo ""
+    echo "ERROR: cargo sort check failed. Run 'cargo sort -w' and re-commit."
+    echo ""
+    exit 1
+fi
