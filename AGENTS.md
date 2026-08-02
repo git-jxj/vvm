@@ -104,7 +104,7 @@ git config core.hooksPath .githooks
 - `nightly` → `Nightly` → dir `nightly`
 - `--path ~/vllm` → derived from git state → dir `local-{branch}-{short_hash}`
 
-`vvm use` and `vvm uninstall` try the raw string as a directory name first (for `local-*` etc.), then fall back to specifier parsing.
+`vvm use` and `vvm uninstall` try the raw string as a directory name first (for `local-*` etc.), then as an alias, then fall back to specifier parsing. Both must accept aliases — `uninstall` once lacked the alias step, so `vvm uninstall dev` fell into release parsing and errored on the mangled name (`Version not found: vdev`). The not-found error reports what the user typed, not the parsed directory name.
 
 ## Conventions
 
