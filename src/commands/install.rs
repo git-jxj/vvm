@@ -421,7 +421,7 @@ pub fn run(
                             );
                             true
                         } else {
-                            prompt_compile_fallback(&spinner, &e.to_string())
+                            prompt_compile_fallback(&spinner, &e.to_string(), OnDecline::Abort)
                         };
                         if proceed {
                             reused_kernels = false; // compiling for real now
@@ -1081,7 +1081,7 @@ fn install_branch_with_fallback(
                     );
                     let reason =
                         format_range_drift_reason(&requested, commit, &compiled, &responsible);
-                    if prompt_compile_fallback(spinner, &reason) {
+                    if prompt_compile_fallback(spinner, &reason, OnDecline::InstallPrecompiled) {
                         return compile_at_ref(venv_path, specifier, commit_hash, cuda, spinner);
                     }
                     log_info(
@@ -1109,7 +1109,7 @@ fn install_branch_with_fallback(
         std::env::consts::ARCH,
         cuda.as_str()
     );
-    if prompt_compile_fallback(spinner, &reason) {
+    if prompt_compile_fallback(spinner, &reason, OnDecline::Abort) {
         return compile_at_ref(venv_path, specifier, commit_hash, cuda, spinner);
     }
 
@@ -1331,7 +1331,7 @@ fn install_from_pr(
                 .filter(|f| has_compiled_changes(std::slice::from_ref(f)))
                 .collect();
             let reason = format_drift_reason(&format!("PR #{}", pr_num), &compiled);
-            if prompt_compile_fallback(spinner, &reason) {
+            if prompt_compile_fallback(spinner, &reason, OnDecline::InstallPrecompiled) {
                 return compile_at_ref(venv_path, specifier, &None, cuda, spinner);
             }
             log_info(
@@ -1385,7 +1385,7 @@ fn install_from_pr(
                         std::env::consts::ARCH,
                         cuda.as_str()
                     );
-                    if prompt_compile_fallback(spinner, &reason) {
+                    if prompt_compile_fallback(spinner, &reason, OnDecline::Abort) {
                         return compile_at_ref(venv_path, specifier, &None, cuda, spinner);
                     }
                     return Err(VvmError::CommandFailed {
@@ -1523,7 +1523,7 @@ fn install_from_local(
                         cuda.as_str()
                     ),
                 };
-                if prompt_compile_fallback(spinner, &err.to_string()) {
+                if prompt_compile_fallback(spinner, &err.to_string(), OnDecline::Abort) {
                     return install_from_local_compiled(venv_path, repo_path, cuda, spinner)
                         .map(|_| ());
                 }
@@ -1554,7 +1554,7 @@ fn install_from_local(
                         repo_path
                     ),
                 };
-                if prompt_compile_fallback(spinner, &err.to_string()) {
+                if prompt_compile_fallback(spinner, &err.to_string(), OnDecline::Abort) {
                     return install_from_local_compiled(venv_path, repo_path, cuda, spinner)
                         .map(|_| ());
                 }
@@ -2517,7 +2517,7 @@ fn install_from_source(
                 std::env::consts::ARCH,
                 cuda.as_str()
             );
-            if prompt_compile_fallback(spinner, &reason) {
+            if prompt_compile_fallback(spinner, &reason, OnDecline::Abort) {
                 return compile_at_ref(venv_path, specifier, commit_hash, cuda, spinner);
             }
             return Err(VvmError::CommandFailed {
@@ -2557,13 +2557,18 @@ fn install_from_source(
                 .unwrap_or_default();
                 let reason =
                     format_range_drift_reason(&requested, &good_commit, &compiled, &responsible);
-                if prompt_compile_fallback(spinner, &reason) {
+                // For `commit:X` the user asked for a precise ref — silently
+                // installing a nearby wheel is silently-wrong, so declining
+                // aborts. Branch still falls through (older wheel + warning)
+                // since "approximately the branch" is a reasonable best-effort.
+                let on_decline = if matches!(specifier, VersionSpecifier::Commit(_)) {
+                    OnDecline::Abort
+                } else {
+                    OnDecline::InstallPrecompiled
+                };
+                if prompt_compile_fallback(spinner, &reason, on_decline) {
                     return compile_at_ref(venv_path, specifier, commit_hash, cuda, spinner);
                 }
-                // For `commit:X` the user asked for a precise ref — silently
-                // installing a nearby wheel is silently-wrong, so abort.
-                // Branch still falls through (older wheel + warning) since
-                // "approximately the branch" is a reasonable best-effort.
                 if matches!(specifier, VersionSpecifier::Commit(_)) {
                     return Err(VvmError::CommandFailed {
                         cmd: "install".to_string(),
@@ -2826,10 +2831,31 @@ fn log_info(spinner: &ProgressBar, msg: String) {
     }
 }
 
+/// What declining the compile prompt does at a given call site, so the
+/// [y/N] line can say it. "n" quietly meaning "install the wheel anyway"
+/// at one site and "abort" at another is how a user ends up watching an
+/// install they thought they had just cancelled.
+#[derive(Clone, Copy)]
+enum OnDecline {
+    /// Proceed with the precompiled wheel (a warning explains what it lacks).
+    InstallPrecompiled,
+    /// Fail the install.
+    Abort,
+}
+
+impl OnDecline {
+    fn hint(self) -> &'static str {
+        match self {
+            OnDecline::InstallPrecompiled => "install precompiled wheel anyway",
+            OnDecline::Abort => "abort",
+        }
+    }
+}
+
 /// Interactive prompt offering to retry with `--compile` when no usable
 /// precompiled wheel is available. Returns false when stdin isn't a TTY
 /// so non-interactive runs keep failing loudly.
-fn prompt_compile_fallback(spinner: &ProgressBar, reason: &str) -> bool {
+fn prompt_compile_fallback(spinner: &ProgressBar, reason: &str, on_decline: OnDecline) -> bool {
     use std::io::{self, BufRead, IsTerminal, Write};
     if AUTO_YES.load(Ordering::Relaxed) {
         spinner.suspend(|| {
@@ -2849,8 +2875,9 @@ fn prompt_compile_fallback(spinner: &ProgressBar, reason: &str) -> bool {
         eprintln!();
         eprintln!("{}", reason.yellow());
         eprint!(
-            "{} Install with source compilation? This may take 15-30 min. [y/N] ",
-            "?".cyan().bold()
+            "{} Compile from source? This may take 15-30 min. [y = compile / N = {}] ",
+            "?".cyan().bold(),
+            on_decline.hint()
         );
         let _ = io::stderr().flush();
         let mut line = String::new();
@@ -3390,7 +3417,7 @@ fn build_metadata(
 fn quick_capture_version(venv_path: &std::path::Path) -> Option<String> {
     let python = venv_path.join("bin/python");
     let output = std::process::Command::new(&python)
-        .args(["-c", "import vllm; print(vllm.__version__, end='')"])
+        .args(["-I", "-c", "import vllm; print(vllm.__version__, end='')"])
         .env("VIRTUAL_ENV", venv_path)
         .output()
         .ok()?;
@@ -3416,8 +3443,16 @@ fn quick_capture_version(venv_path: &std::path::Path) -> Option<String> {
 /// present (vllm/*.abi3.so). Loading all of them also catches duplicate op
 /// registration from stale binaries left in an editable-install source tree.
 const VERIFY_SCRIPT: &str = r#"
-import importlib, pathlib
+import importlib, pathlib, sys
 import vllm
+if vllm.__file__ is None:
+    sys.stderr.write(
+        'import vllm resolved to a namespace package, not the installed vllm --\n'
+        'no directory on sys.path holds vllm/__init__.py, only bare vllm/ dirs at:\n'
+        '  %s\n'
+        'sys.path: %s\n' % (list(getattr(vllm, '__path__', [])), sys.path)
+    )
+    sys.exit(3)
 exts = sorted(f.name.split('.')[0] for f in pathlib.Path(vllm.__file__).parent.glob('*.abi3.so'))
 assert exts, 'no compiled vllm extensions (vllm/*.abi3.so) found'
 for ext in exts:
@@ -3442,8 +3477,14 @@ fn verify_installation(
         VERIFY_SCRIPT
     };
 
+    // -I (isolated mode): verification must test the venv, not the caller's
+    // shell. Clusters routinely export PYTHONPATH/PYTHONHOME via module/conda
+    // setups, and `python -c` also puts the cwd on sys.path — any of which can
+    // shadow the venv's vllm (a stray bare `vllm/` dir resolves as a namespace
+    // package with `__file__ = None`). The venv's own site-packages, including
+    // editable-install .pth wiring, is unaffected by -I.
     let output = match std::process::Command::new(&python)
-        .args(["-c", script])
+        .args(["-I", "-c", script])
         .env("VIRTUAL_ENV", venv_path)
         .output()
     {
@@ -3465,7 +3506,15 @@ fn verify_installation(
         stderr.chars().take(500).collect::<String>()
     };
 
-    let hint = if stderr.contains("libcudart") || stderr.contains("cannot open shared object") {
+    let hint = if stderr.contains("resolved to a namespace package") {
+        format!(
+            "vllm did not import from the venv — python found only bare vllm/ directories \
+             (a namespace package), so the install's own vllm is unreachable:\n{}\n\
+             Verification ran with `python -I`, so this is not shell pollution: the venv's \
+             vllm package itself is missing or its editable source tree is gone.",
+            stderr_excerpt
+        )
+    } else if stderr.contains("libcudart") || stderr.contains("cannot open shared object") {
         let followup = match specifier {
             VersionSpecifier::Nightly => format!(
                 "Nightly wheel may not be available for {}/{}.\n\
