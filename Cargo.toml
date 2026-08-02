@@ -1,6 +1,6 @@
 [package]
 name = "vvm"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "vLLM Version Manager - manage multiple vLLM installations"
 license = "Apache-2.0"

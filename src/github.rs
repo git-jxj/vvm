@@ -11,7 +11,7 @@ const API_BASE: &str = "https://api.github.com";
 
 fn build_client() -> Result<Client, VvmError> {
     Ok(Client::builder()
-        .user_agent("vvm/0.1.0")
+        .user_agent(concat!("vvm/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(30))
         .build()?)
 }

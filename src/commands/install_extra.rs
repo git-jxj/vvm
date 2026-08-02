@@ -146,7 +146,7 @@ fn read_file_from_active_vllm(config: &Config, rel_path: &str) -> Option<String>
         github_ref, rel_path
     );
     let client = reqwest::blocking::Client::builder()
-        .user_agent("vvm/0.1.0")
+        .user_agent(concat!("vvm/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(10))
         .build()
         .ok()?;

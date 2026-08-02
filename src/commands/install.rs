@@ -3129,7 +3129,7 @@ fn format_range_drift_reason(
 /// connection reuse across the 30-commit fallback loop).
 fn wheel_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .user_agent("vvm/0.1.0")
+        .user_agent(concat!("vvm/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("failed to build HTTP client")

@@ -21,6 +21,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The binary self-reports CARGO_PKG_VERSION, so a tag whose Cargo.toml
+      # wasn't bumped ships a binary claiming the previous version (v0.1.1
+      # shipped a "vvm 0.1.0"). Fail the release instead.
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag v${tag} does not match Cargo.toml version ${cargo_version}." \
+                 "Bump Cargo.toml (and Cargo.lock: cargo update -p vvm), commit, then re-tag."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
