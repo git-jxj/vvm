@@ -1297,11 +1297,34 @@ fn install_from_pr(
         _ => unreachable!(),
     };
 
-    // Drift check before we clone + fetch: a PR touching csrc/ means the
-    // precompiled wheel won't exercise the PR's changes. On YES, fall through
-    // to compile_at_ref below (which clones, checks out the PR ref, and
-    // compiles); on NO, install with the precompiled wheel + a warning.
-    if let Ok(files) = github::pr_changed_files(pr_num) {
+    let client = wheel_client();
+
+    // A merged PR needs no drift check at all: upstream CI built a wheel at the
+    // merge commit, and that wheel's compiled extensions already contain the
+    // PR's C++/CUDA changes. Without this, wheel selection below keys off the
+    // PR head's timestamp, lands on a main commit from *before* the merge, and
+    // then offers a 15-30 min compile to reproduce kernels that were published
+    // hours earlier. Only pin it when the wheel actually exists — a merge
+    // commit whose build failed falls back to the normal path.
+    let merged_wheel_commit = github::pr_merge_commit(pr_num)
+        .ok()
+        .flatten()
+        .filter(|sha| lookup_wheel_url(&client, sha, cuda).is_some());
+
+    if let Some(sha) = &merged_wheel_commit {
+        log_info(
+            spinner,
+            format!(
+                "  PR #{} is merged — using its merge commit's wheel ({})",
+                pr_num,
+                sha[..12.min(sha.len())].cyan()
+            ),
+        );
+    } else if let Ok(files) = github::pr_changed_files(pr_num) {
+        // Still open (or merged without a wheel): a PR touching csrc/ means the
+        // precompiled wheel won't exercise the PR's changes. On YES, fall through
+        // to compile_at_ref below (which clones, checks out the PR ref, and
+        // compiles); on NO, install with the precompiled wheel + a warning.
         if has_compiled_changes(&files) {
             let compiled: Vec<String> = files
                 .into_iter()
@@ -1346,31 +1369,35 @@ fn install_from_pr(
     co_args.push(&pr_branch);
     venv::run_in_venv(venv_path, "git", &co_args)?;
 
-    // Use the PR checkout's HEAD timestamp to find a precompiled wheel from
-    // roughly the same time period, reducing code divergence between the PR
-    // source and the wheel's compiled extensions.
-    let until = local_head_timestamp(&src_str);
-    let client = wheel_client();
-    let (good_commit, _url) = match find_good_wheel_commit(&client, cuda, until.as_deref(), None) {
-        Some(v) => v,
+    let good_commit = match merged_wheel_commit {
+        Some(sha) => sha,
         None => {
-            let reason = format!(
-                "No precompiled wheel found for PR #{} on {}/{}.",
-                pr_num,
-                std::env::consts::ARCH,
-                cuda.as_str()
-            );
-            if prompt_compile_fallback(spinner, &reason) {
-                return compile_at_ref(venv_path, specifier, &None, cuda, spinner);
+            // Use the PR checkout's HEAD timestamp to find a precompiled wheel from
+            // roughly the same time period, reducing code divergence between the PR
+            // source and the wheel's compiled extensions.
+            let until = local_head_timestamp(&src_str);
+            match find_good_wheel_commit(&client, cuda, until.as_deref(), None) {
+                Some((commit, _url)) => commit,
+                None => {
+                    let reason = format!(
+                        "No precompiled wheel found for PR #{} on {}/{}.",
+                        pr_num,
+                        std::env::consts::ARCH,
+                        cuda.as_str()
+                    );
+                    if prompt_compile_fallback(spinner, &reason) {
+                        return compile_at_ref(venv_path, specifier, &None, cuda, spinner);
+                    }
+                    return Err(VvmError::CommandFailed {
+                        cmd: "precompiled wheel lookup".to_string(),
+                        detail: format!(
+                            "No precompiled wheel found for {}/{}.",
+                            std::env::consts::ARCH,
+                            cuda.as_str()
+                        ),
+                    });
+                }
             }
-            return Err(VvmError::CommandFailed {
-                cmd: "precompiled wheel lookup".to_string(),
-                detail: format!(
-                    "No precompiled wheel found for {}/{}.",
-                    std::env::consts::ARCH,
-                    cuda.as_str()
-                ),
-            });
         }
     };
 

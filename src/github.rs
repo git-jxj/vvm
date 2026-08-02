@@ -16,20 +16,48 @@ fn build_client() -> Result<Client, VvmError> {
         .build()?)
 }
 
+/// Where a token came from. Kept alongside the token so a rejected one can
+/// name the exact thing to fix — "$GITHUB_TOKEN is expired" is actionable,
+/// "HTTP 401" is not.
+#[derive(Clone, Copy)]
+enum TokenSource {
+    GithubTokenEnv,
+    GhTokenEnv,
+    GhCli,
+}
+
+impl TokenSource {
+    fn name(self) -> &'static str {
+        match self {
+            TokenSource::GithubTokenEnv => "$GITHUB_TOKEN",
+            TokenSource::GhTokenEnv => "$GH_TOKEN",
+            TokenSource::GhCli => "`gh auth token`",
+        }
+    }
+
+    fn fix_hint(self) -> &'static str {
+        match self {
+            TokenSource::GithubTokenEnv => "Unset GITHUB_TOKEN or replace it with a valid token",
+            TokenSource::GhTokenEnv => "Unset GH_TOKEN or replace it with a valid token",
+            TokenSource::GhCli => "Run `gh auth login` to re-authenticate",
+        }
+    }
+}
+
 /// Resolve a GitHub token from env vars, falling back to `gh auth token`.
 /// Cached per-process so we don't fork `gh` on every API call.
-fn resolve_token() -> Option<String> {
-    static CACHED: OnceLock<Option<String>> = OnceLock::new();
+fn resolve_token() -> Option<(String, TokenSource)> {
+    static CACHED: OnceLock<Option<(String, TokenSource)>> = OnceLock::new();
     CACHED
         .get_or_init(|| {
             if let Ok(t) = std::env::var("GITHUB_TOKEN") {
                 if !t.is_empty() {
-                    return Some(t);
+                    return Some((t, TokenSource::GithubTokenEnv));
                 }
             }
             if let Ok(t) = std::env::var("GH_TOKEN") {
                 if !t.is_empty() {
-                    return Some(t);
+                    return Some((t, TokenSource::GhTokenEnv));
                 }
             }
             let output = std::process::Command::new("gh")
@@ -43,14 +71,14 @@ fn resolve_token() -> Option<String> {
             if token.is_empty() {
                 None
             } else {
-                Some(token)
+                Some((token, TokenSource::GhCli))
             }
         })
         .clone()
 }
 
 fn auth_header() -> Option<String> {
-    resolve_token().map(|t| format!("Bearer {}", t))
+    resolve_token().map(|(t, _)| format!("Bearer {}", t))
 }
 
 /// Attach standard GitHub API headers (Accept + optional auth) to a request.
@@ -65,6 +93,9 @@ fn with_headers(req: RequestBuilder) -> RequestBuilder {
 /// Convert a non-success response into a typed error. 403/429 with
 /// X-RateLimit-Remaining: 0 become a targeted "rate limit" message
 /// that tells the user to set GITHUB_TOKEN, since that's the fix 99% of the time.
+/// 401 is the mirror image: GitHub only answers 401 when credentials were sent
+/// and rejected, so the request would have succeeded anonymously — the token,
+/// not the ref, is what's broken.
 fn response_error(resp: Response, context: &str) -> VvmError {
     let status = resp.status();
     let remaining = resp
@@ -99,6 +130,18 @@ fn response_error(resp: Response, context: &str) -> VvmError {
         ));
     }
 
+    if status.as_u16() == 401 {
+        if let Some((_, source)) = resolve_token() {
+            return VvmError::GitHubApi(format!(
+                "{}: the token from {} was rejected (invalid, expired, or revoked). {} \
+                 — public repos need no token at all.",
+                context,
+                source.name(),
+                source.fix_hint()
+            ));
+        }
+    }
+
     VvmError::GitHubApi(format!("{}: HTTP {}", context, status))
 }
 
@@ -116,11 +159,24 @@ fn get_json<T: DeserializeOwned>(path: &str, context: &str) -> Result<T, VvmErro
 #[derive(Deserialize)]
 struct PrResponse {
     head: PrHead,
+    #[serde(default)]
+    merged: bool,
+    merge_commit_sha: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct PrHead {
     sha: String,
+}
+
+impl PrResponse {
+    fn merged_commit(self) -> Option<String> {
+        if self.merged {
+            self.merge_commit_sha
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -177,6 +233,16 @@ pub fn pr_head_commit(pr_number: u64) -> Result<String, VvmError> {
     let path = format!("/repos/{}/pulls/{}", REPO, pr_number);
     let pr: PrResponse = get_json(&path, &format!("PR #{}", pr_number))?;
     Ok(pr.head.sha)
+}
+
+/// The commit a merged PR landed on `main` as, or `None` while it is still
+/// open or was closed unmerged. GitHub fills `merge_commit_sha` for open PRs
+/// too — with the throwaway test-merge commit behind `refs/pull/N/merge`, which
+/// exists on no branch and has no wheel — so `merged` has to gate it.
+pub fn pr_merge_commit(pr_number: u64) -> Result<Option<String>, VvmError> {
+    let path = format!("/repos/{}/pulls/{}", REPO, pr_number);
+    let pr: PrResponse = get_json(&path, &format!("PR #{}", pr_number))?;
+    Ok(pr.merged_commit())
 }
 
 /// Get the HEAD commit SHA for a branch.
@@ -327,4 +393,39 @@ pub fn recent_main_commits_until(
     };
     let commits: Vec<CommitResponse> = get_json(&path, "Commits")?;
     Ok(commits.into_iter().map(|c| c.sha).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Option<String> {
+        serde_json::from_str::<PrResponse>(json)
+            .unwrap()
+            .merged_commit()
+    }
+
+    #[test]
+    fn merged_pr_yields_its_merge_commit() {
+        let json = r#"{"head":{"sha":"5a3eba03"},"merged":true,
+                       "merge_commit_sha":"aeeb36b1"}"#;
+        assert_eq!(parse(json).as_deref(), Some("aeeb36b1"));
+    }
+
+    /// An open PR carries a merge_commit_sha too — the throwaway test-merge
+    /// behind refs/pull/N/merge, which is on no branch and has no wheel.
+    /// Taking it would pin the install to a commit wheels.vllm.ai never built.
+    #[test]
+    fn open_pr_yields_nothing_despite_merge_commit_sha() {
+        let json = r#"{"head":{"sha":"5a3eba03"},"merged":false,
+                       "merge_commit_sha":"deadbeef"}"#;
+        assert_eq!(parse(json), None);
+    }
+
+    /// Older API payloads (and some proxies) omit `merged` entirely.
+    #[test]
+    fn missing_merged_field_defaults_to_not_merged() {
+        let json = r#"{"head":{"sha":"5a3eba03"},"merge_commit_sha":"deadbeef"}"#;
+        assert_eq!(parse(json), None);
+    }
 }
