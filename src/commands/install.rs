@@ -9,9 +9,15 @@ use std::time::Duration;
 /// CLI flag so we don't have to thread it through every install path.
 static AUTO_YES: AtomicBool = AtomicBool::new(false);
 
+/// Set once the new install is live (current symlink updated). The SIGINT
+/// handler checks it so a late Ctrl+C doesn't delete a completed install or
+/// resurrect the parked old version over it.
+static INSTALL_FINALIZED: AtomicBool = AtomicBool::new(false);
+
 use crate::config::Config;
 use crate::cuda::{has_gpu_access, CudaVariant};
 use crate::errors::VvmError;
+use crate::fsutil;
 use crate::fsutil::remove_dir_all_robust;
 use crate::github;
 use crate::metadata::VersionMetadata;
@@ -192,6 +198,14 @@ pub fn run(
 
     let version_dir = config.versions_dir().join(&dir_name);
 
+    // Finish the job of any interrupted deletion from a previous run.
+    fsutil::sweep_stale_trash(&config.versions_dir());
+
+    // Update/force paths park the old install aside instead of deleting it,
+    // so a failed or interrupted install restores it (guard Drop + SIGINT
+    // handler below). Removed only after the new install succeeds.
+    let mut parked: Option<fsutil::ParkedVersion> = None;
+
     if version_dir.exists() {
         if force {
             println!(
@@ -199,7 +213,7 @@ pub fn run(
                 "Removing".yellow().bold(),
                 dir_name.cyan()
             );
-            remove_dir_all_robust(&version_dir)?;
+            parked = Some(fsutil::ParkedVersion::park(&version_dir).map_err(VvmError::Io)?);
         } else if reclaim_abandoned_install(&version_dir, &dir_name)? {
             // Wreckage of an interrupted install — removed, fall through and
             // install fresh in this same command.
@@ -223,7 +237,7 @@ pub fn run(
                 old_short,
                 new_short,
             );
-            remove_dir_all_robust(&version_dir)?;
+            parked = Some(fsutil::ParkedVersion::park(&version_dir).map_err(VvmError::Io)?);
         } else {
             return auto_use(config, &dir_name, &version_dir);
         }
@@ -267,13 +281,21 @@ pub fn run(
 
     // Clean up the partial install directory if the user hits Ctrl+C mid-install.
     // Without this, a half-built venv with a stale .installing lock gets left behind.
+    // If an old version was parked for this update, rename it back — exit()
+    // skips Drop, so the ParkedVersion guard can't do it for us here.
     // handler runs on the signal thread; don't hold locks/FS state that needs the
     // main thread to finalize — just rm -rf and exit(130), which is the canonical
     // SIGINT exit code.
     {
         let cleanup_dir = version_dir.clone();
+        let restore = parked.as_ref().map(|p| p.restore_paths());
         let _ = ctrlc::set_handler(move || {
-            let _ = std::fs::remove_dir_all(&cleanup_dir);
+            if !INSTALL_FINALIZED.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_dir_all(&cleanup_dir);
+                if let Some((parked, original)) = &restore {
+                    let _ = std::fs::rename(parked, original);
+                }
+            }
             std::process::exit(130);
         });
     }
@@ -505,6 +527,13 @@ pub fn run(
     {
         let _ = std::fs::remove_dir_all(&version_dir); // removes lock too
         return Err(VvmError::Io(e));
+    }
+
+    // The new install is live: stop protecting against rollback, then delete
+    // the parked old version (updates/--force only).
+    INSTALL_FINALIZED.store(true, Ordering::Relaxed);
+    if let Some(p) = parked.take() {
+        p.commit();
     }
 
     // Set default alias if this is the first installation

@@ -28,15 +28,18 @@ vvm use 0.26.0         # switch the active version in your current shell
 
 ## Install
 
-### Prebuilt binaries (Linux)
+```bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vvm/main/install.sh | bash
+```
+
+Downloads the prebuilt binary for your platform (Linux x86_64/aarch64) into `~/.local/bin` and adds shell integration (tab completion + in-place version switching) to your profile. Start a new terminal or `source ~/.bashrc` to activate. Options pass through `bash -s`, e.g. `... | bash -s -- --to ~/bin`.
+
+### Manual install
+
+If you'd rather not pipe to bash, grab the binary and wire up the shell yourself:
 
 ```bash
 curl -fsSL https://github.com/vllm-project/vvm/releases/latest/download/vvm-$(uname -m)-linux-musl -o vvm && chmod +x vvm && mv vvm ~/.local/bin/
-```
-
-Then add shell integration (tab completion + in-place version switching) to your profile:
-
-```bash
 echo 'eval "$(vvm init bash)"' >> ~/.bashrc   # or: vvm init zsh / vvm init fish
 ```
 
@@ -56,8 +59,6 @@ cd vvm
 ./install.sh            # builds release, installs to ~/.local/bin, configures your shell
 # or: ./install.sh --to ~/bin
 ```
-
-Start a new terminal or run `source ~/.bashrc` to activate.
 
 ## Quick Start
 

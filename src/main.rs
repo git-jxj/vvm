@@ -228,6 +228,7 @@ fn main() {
                         rd.filter_map(|e| e.ok())
                             .filter(|e| e.path().is_dir())
                             .map(|e| e.file_name().to_string_lossy().to_string())
+                            .filter(|name| !name.starts_with('.'))
                             .collect()
                     })
                     .unwrap_or_default();

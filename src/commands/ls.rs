@@ -38,6 +38,9 @@ pub fn run(config: &Config, json: bool) -> Result<(), VvmError> {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().to_string())
+        // Hidden entries are vvm's own machinery (.vvm-trash-* deletions in
+        // progress, .vvm-prev-* parked backups), never installed versions.
+        .filter(|name| !name.starts_with('.'))
         .collect();
 
     entries.sort();
