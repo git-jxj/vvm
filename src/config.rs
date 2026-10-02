@@ -16,6 +16,15 @@ impl Config {
                     .expect("cannot determine home directory")
                     .join(".vvm")
             });
+        // Symlink targets and shell activation paths must remain valid after
+        // changing directories, including when VVM_DIR is a relative path.
+        let base_dir = if base_dir.is_relative() {
+            std::env::current_dir()
+                .expect("cannot determine current directory")
+                .join(base_dir)
+        } else {
+            base_dir
+        };
         Self { base_dir }
     }
 
